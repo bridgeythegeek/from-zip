@@ -1,4 +1,5 @@
 import argparse
+import json
 import re
 import zipfile
 from enum import Enum
@@ -28,8 +29,50 @@ class FromZip:
         self.passwords = passwords
         self.match_case = match_case
 
-    def __enter__(self):
         self.zip_file = zipfile.ZipFile(self.zip_path)
+        self.file_list = {}
+        
+        valid_manifest = False
+        if 'manifest.json' in self.zip_file.namelist():
+            with self.zip_file.open('manifest.json') as manifest:
+                try:
+                    j = json.load(manifest)
+                    valid_manifest = True
+                except:
+                    pass
+            if not 'audits' in j:
+                raise Exception('audits missing from FireEye manifest')
+            for audit in j['audits']:
+                if not 'generator' in audit:
+                    raise Exception('generator missing from audit')
+                if audit['generator'] == 'multifile-acquisition-api':
+                    if not 'results' in audit:
+                        raise Exception('results missing from audit')
+                    for i, result in enumerate(audit['results']):
+                        if not 'payload' in result:
+                            raise Exception(f'payload missing from audit result[{i}]')
+                        if not 'metadata' in result:
+                            raise Exception(f'metadata missing from audit result[{i}]')
+                        filename = None
+                        filepath = None                            
+                        for meta in result['metadata']:
+                            if 'name' in meta and 'value' in meta:
+                                if meta['name'] == 'mandiant/mir/agent/FileName' and self.matcher(meta['value']):
+                                    filename = meta['value']
+                                if meta['name'] == 'mandiant/mir/agent/FilePath':
+                                    filepath = meta['value']
+                                if not filename is None and not filepath is None:
+                                    if '\\' in filepath:
+                                        self.file_list[result['payload']] = '\\'.join((filepath, filename))
+                                    else:
+                                        self.file_list[result['payload']] = '/'.join((filepath, filename))
+        
+        if not valid_manifest:
+            for zip_info in self.zip_file.infolist():
+                if not zip_info.is_dir() and self.matcher(zip_info.filename):
+                    self.file_list[zip_info.filename] = zip_info.filename
+
+    def __enter__(self):
         return self
 
     def __exit__(self, exception_type, exception_value, exception_traceback):
@@ -57,24 +100,23 @@ class FromZip:
         return not (re.search(self.pattern, item) is None)
 
     def names(self):
-        for zip_info in self.zip_file.infolist():
-            if not zip_info.is_dir() and self.matcher(zip_info.filename):
-                yield zip_info.filename
+        for filename in self.file_list:
+            yield filename
 
     def infos(self):
         for zip_info in self.zip_file.infolist():
-            if not zip_info.is_dir() and self.matcher(zip_info.filename):
+            if zip_info.filename in self.file_list:
                 yield zip_info
 
     def files(self):
         for zip_info in self.zip_file.infolist():
-            if not zip_info.is_dir() and self.matcher(zip_info.filename):
+            if not zip_info.is_dir() and zip_info.filename in self.file_list:
                 opened = False
                 for password in self.passwords:
                     pwd = None if password is None else bytes(password, 'utf-8')
                     try:
                         with self.zip_file.open(zip_info, pwd=pwd) as f:
-                            yield f
+                            yield zip_info.filename, f
                         opened = True
                         break
                     except RuntimeError:
@@ -101,6 +143,6 @@ if __name__ == '__main__':
         for e in fz.infos():
             print(e)
         print("Bytes\n=====")
-        for e in fz.files():
+        for filename, e in fz.files():
+            print(filename)
             print(e.read())
-
